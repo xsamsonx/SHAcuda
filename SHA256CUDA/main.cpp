@@ -15,30 +15,92 @@
 #define NUMBLOCKS (SHA_PER_ITERATIONS + BLOCK_SIZE - 1) / BLOCK_SIZE
 
 
-static uint64_t nonce = 0;
-static uint64_t user_nonce = 0;
+char nonce[65];
 
-// Does the same as sprintf(char*, "%d%s", int, const char*) but a bit faster
-__device__ size_t nonce_to_str(uint64_t nonce, unsigned char* out) {
-	uint64_t result = nonce;
-	uint8_t remainder;
-	size_t nonce_size = nonce == 0 ? 1 : floor(log10((double)nonce)) + 1;
-	size_t i = nonce_size;
-	while (result >= 10) {
-		remainder = result % 10;
-		result /= 10;
-		out[--i] = remainder + '0';
+void bignum_add_host(size_t idx, char* a, char* b) {
+	int i = 0, alen, t;
+	for (i = 0; a[i]; i++) {
+		b[i] = a[i];
 	}
+	alen = i;
+	char *s = nullptr;
+	int k = 0, p;
+	while (idx) {
+		p = idx % 10;
+		idx /= 10;
+		s[k++] = p + '0';
+	}
+	p = 0;
+	for (t = 0; t < k || t < alen; t++) {
+		if (t < alen) p += b[t] - '0';
+		if (t < k) p += s[t] - '0';
+		b[t] = p % 10 + '0';
+		p /= 10;
+	}
+	while (p) {
+		b[t] = p % 10 + '0';
+		p /= 10;
+		t++;
+	}
+	b[t] = 0;
+	return;
+}
 
-	out[0] = result + '0';
-	i = nonce_size;
-	out[i] = 0;
+__device__ unsigned char EncodeBase58(char* input, const int len, unsigned char result[]) {
+	const char * const ALPHABET =
+		"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+	/*const char ALPHABET_MAP[128] = {
+		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+		-1,  0,  1,  2,  3,  4,  5,  6,  7,  8, -1, -1, -1, -1, -1, -1,
+		-1,  9, 10, 11, 12, 13, 14, 15, 16, -1, 17, 18, 19, 20, 21, -1,
+		22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, -1, -1, -1, -1, -1,
+		-1, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, -1, 44, 45, 46,
+		47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, -1, -1, -1, -1, -1
+	};*/
+	unsigned char digits[64];//[len * 137 / 100] Not sure but think problem is here...
+	int digitslen = 1;
+	for (int i = 0; i < len; i++) {
+		unsigned int carry = (unsigned int)input[i];
+		for (int j = 0; j < digitslen; j++) {
+			carry += (unsigned int)(digits[j]) << 8;
+			digits[j] = (unsigned char)(carry % 58);
+			carry /= 58;
+		}
+		while (carry > 0) {
+			digits[digitslen++] = (unsigned char)(carry % 58);
+			carry /= 58;
+		}
+	}
+	int resultlen = 0;
+	// leading zero bytes
+	for (; resultlen < len && input[resultlen] == 0;)
+		result[resultlen++] = '1';
+	// reverse
+	for (int i = 0; i < digitslen; i++)
+		result[resultlen + i] = ALPHABET[digits[digitslen - 1 - i]];
+	result[digitslen + resultlen] = 0;
+	return digitslen + resultlen;
+}
+
+__device__ int my_strlen(unsigned char *str) {
+	int i = 0;
+	while (str[i++] != '\0');
+	i--;
 	return i;
 }
 
+/*__device__ char * my_strcpy(char *dest, const char *src) {
+	int i = 0;
+	do {
+		dest[i] = src[i];
+	} while (src[i++] != 0);
+	return dest;
+}*/
 
 extern __shared__ char array[];
-__global__ void sha256_kernel(const char* in_input_string, size_t in_input_string_size, uint64_t nonce_offset) {
+__global__ void sha256_kernel(const char* in_input_string, size_t in_input_string_size, char * nonce_offset) {
 
 	// If this is the first thread of the block, init the input string in shared memory
 	char* in = (char*) &array[0];
@@ -49,7 +111,7 @@ __global__ void sha256_kernel(const char* in_input_string, size_t in_input_strin
 	__syncthreads(); // Ensure the input string has been written in SMEM
 
 	uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-	uint64_t nonce = idx + nonce_offset;
+	char* nonce_out = idx + nonce_offset;
 
 	// The first byte we can write because there is the input string at the begining	
 	// Respects the memory padding of 8 bit (char).
@@ -62,18 +124,20 @@ __global__ void sha256_kernel(const char* in_input_string, size_t in_input_strin
 	unsigned char* out = (unsigned char*)&array[nonce_addr];
 	memset(out, 0, 32);
 
-	size_t size = nonce_to_str(nonce, out);
+	int size = my_strlen(out);
+	
+	EncodeBase58((char*) nonce_out, (int) size, out);
 
 	assert(size <= 32);
 
 	SHA256_CTX ctx;
 	sha256_init(&ctx);
-	sha256_update(&ctx, out, size);
+	sha256_update(&ctx, out, size);//Do i recieve the right size here?
 	sha256_update(&ctx, (unsigned char *)in, in_input_string_size);
 	sha256_final(&ctx, sha);
 
 	if (sha[0] == 0x00) {
-		printf("%u\n", nonce);//prints decimal...
+		printf("%u\n", nonce_out);//base58 conversion missing for print(supposed to print nonce in base58 WITHOUT message "AAAA")
 	}
 }
 
@@ -93,7 +157,7 @@ int main() {
 
 
 	std::cout << " start at number : "; //for testing i use 1
-	std::cin >> user_nonce;
+	std::cin >> nonce;
 
 	const size_t input_size = in.size();
 
@@ -104,21 +168,22 @@ int main() {
 	cudaMalloc(&d_in, input_size + 1);
 	cudaMemcpy(d_in, in.c_str(), input_size + 1, cudaMemcpyHostToDevice);
 
-	nonce += user_nonce;
 
 	pre_sha256();
 
 	size_t dynamic_shared_size = (ceil((input_size + 1) / 8.f) * 8) + (64 * BLOCK_SIZE);
-
-	for (;;) {
+	int a = 0;
+	
+	for (a = 0; a < 2; a++) {//small loop to see if loop nonce-increment is working
+	//for (;;) {
 		sha256_kernel << < NUMBLOCKS, BLOCK_SIZE, dynamic_shared_size >> > (d_in, input_size, nonce);
 
 		cudaError_t err = cudaDeviceSynchronize();
 		if (err != cudaSuccess) {
 			throw std::runtime_error("Device error");
 		}
-
-		nonce += SHA_PER_ITERATIONS;
+		bignum_add_host(SHA_PER_ITERATIONS, nonce, nonce);
+		//nonce += SHA_PER_ITERATIONS;
 	}
 
 }
